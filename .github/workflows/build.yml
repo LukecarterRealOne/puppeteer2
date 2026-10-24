@@ -1,0 +1,138 @@
+name: Build Puppeteer (Minecraft 1.20.1)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Fabric mod
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Supports either an extracted project at the repository root, or a
+      # Puppeteer source ZIP uploaded to the repository root.
+      - name: Locate Puppeteer project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          is_puppeteer_project() {
+            local dir="$1"
+            [[ -f "$dir/build.gradle" ]] || return 1
+            [[ -f "$dir/settings.gradle" ]] || return 1
+            [[ -f "$dir/gradle.properties" ]] || return 1
+            [[ -f "$dir/src/main/java/com/puppeteer/PuppeteerMod.java" ]] || return 1
+            [[ -f "$dir/src/main/resources/fabric.mod.json" ]] || return 1
+            grep -Eq '"id"[[:space:]]*:[[:space:]]*"puppeteer"' "$dir/src/main/resources/fabric.mod.json"
+          }
+
+          find_project() {
+            local root="$1" file candidate
+            if is_puppeteer_project "$root"; then
+              printf '%s\n' "$root"
+              return 0
+            fi
+            while IFS= read -r file; do
+              candidate="$(dirname "$file")"
+              if is_puppeteer_project "$candidate"; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done < <(find "$root" -type f -name build.gradle \
+              -not -path '*/.git/*' -not -path '*/build/*' -print | sort)
+            return 1
+          }
+
+          project_dir="$(find_project "$GITHUB_WORKSPACE" || true)"
+
+          if [[ -z "$project_dir" ]]; then
+            echo "No extracted Puppeteer project found; checking source ZIP files."
+            # Prefer the latest staff-fix package if multiple archives are present.
+            mapfile -t archives < <(
+              find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -iname '*.zip' -printf '%p\n' \
+                | awk 'tolower($0) ~ /staff-fix/ { print "0 " $0; next }
+                       tolower($0) ~ /wand-fix/  { print "1 " $0; next }
+                       tolower($0) ~ /item-fix/  { print "2 " $0; next }
+                       { print "3 " $0 }' \
+                | sort -k1,1 -k2,2 | cut -d' ' -f2-)
+
+            for archive in "${archives[@]}"; do
+              echo "Checking archive: $(basename "$archive")"
+              if ! unzip -Z1 "$archive" | grep -Eq '(^|/)src/main/java/com/puppeteer/PuppeteerMod\.java$'; then
+                echo "Skipping: PuppeteerMod.java is not present."
+                continue
+              fi
+              if ! unzip -Z1 "$archive" | grep -Eq '(^|/)build\.gradle$'; then
+                echo "Skipping: build.gradle is not present."
+                continue
+              fi
+
+              extract_dir="$RUNNER_TEMP/puppeteer-source"
+              rm -rf "$extract_dir"
+              mkdir -p "$extract_dir"
+              unzip -oq "$archive" -d "$extract_dir"
+              project_dir="$(find_project "$extract_dir" || true)"
+              if [[ -n "$project_dir" ]]; then
+                echo "Using source from $(basename "$archive")"
+                break
+              fi
+              echo "Archive has files, but not a complete Puppeteer project; trying the next ZIP."
+            done
+          fi
+
+          if [[ -z "$project_dir" ]]; then
+            echo "::error::Could not locate a complete Puppeteer 1.20.1 project. Extract the project into the repository root, or upload the source ZIP (not just the workflow file)."
+            echo "Repository contents:"
+            find "$GITHUB_WORKSPACE" -maxdepth 3 -type f -print | sort
+            exit 1
+          fi
+
+          echo "dir=$project_dir" >> "$GITHUB_OUTPUT"
+          echo "Project directory: $project_dir"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: Build mod
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: gradle --no-daemon --no-configuration-cache clean build
+
+      - name: Verify output JAR
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          find build/libs -maxdepth 1 -type f -name '*.jar' \
+            ! -name '*-sources.jar' ! -name '*-dev.jar' -print -quit | grep -q . || {
+              echo '::error::Gradle finished without producing a distributable mod JAR.'
+              ls -la build/libs || true
+              exit 1
+            }
+          ls -lah build/libs
+
+      - name: Upload Puppeteer mod JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: puppeteer-minecraft-1.20.1
+          path: |
+            ${{ steps.project.outputs.dir }}/build/libs/*.jar
+            !${{ steps.project.outputs.dir }}/build/libs/*-sources.jar
+            !${{ steps.project.outputs.dir }}/build/libs/*-dev.jar
+          if-no-files-found: error
+          retention-days: 14
